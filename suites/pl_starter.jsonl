@@ -1,0 +1,24 @@
+{"question": "Wypisz same nazwy miast z tego zdania, oddzielone przecinkami, bez żadnego innego tekstu: \"Pociąg z Wrocławia jechał przez Opole i Katowice do Krakowa.\"", "answer": "Wrocław, Opole, Katowice, Kraków"}
+{"question": "Zwróć wyłącznie poprawny JSON o kluczach \"imie\" i \"wiek\" dla zdania: \"Anna ma 34 lata.\" Bez komentarza i bez bloku kodu.", "answer": "{\"imie\": \"Anna\", \"wiek\": 34}"}
+{"question": "Odmień rzeczownik \"pies\" przez przypadki w liczbie pojedynczej. Podaj same formy, oddzielone przecinkami, w kolejności: mianownik, dopełniacz, celownik, biernik, narzędnik, miejscownik, wołacz.", "answer": "pies, psa, psu, psa, psem, psie, psie"}
+{"question": "Jaka jest stolica Polski? Odpowiedz jednym słowem.", "answer": "Warszawa"}
+{"question": "Przetłumacz na angielski, zwracając samo tłumaczenie: \"Jutro rano muszę odebrać paczkę z paczkomatu.\"", "answer": "Tomorrow morning I have to pick up a parcel from the parcel locker."}
+{"question": "Przetłumacz na polski, zwracając samo tłumaczenie: \"The server ran out of disk space during the backup.\"", "answer": "Serwerowi zabrakło miejsca na dysku podczas tworzenia kopii zapasowej."}
+{"question": "Podaj liczbę mnogą słowa \"ręka\" w mianowniku. Odpowiedz jednym słowem.", "answer": "ręce"}
+{"question": "Streść poniższy tekst w dokładnie jednym zdaniu po polsku: \"Zespół wdrożył nowy system backupu. Kopie są teraz wykonywane co godzinę zamiast raz na dobę, a czas odtwarzania skrócił się z ośmiu godzin do czterdziestu minut.\"", "answer": "Nowy system backupu wykonuje kopie co godzinę zamiast raz na dobę i skrócił czas odtwarzania z ośmiu godzin do czterdziestu minut."}
+{"question": "Ile wynosi 17 procent z 250? Podaj samą liczbę.", "answer": "42,5"}
+{"question": "Wymień dokładnie trzy największe miasta Polski pod względem liczby ludności, w kolejności malejącej, oddzielone przecinkami, bez numeracji.", "answer": "Warszawa, Kraków, Łódź"}
+{"question": "Popraw błąd ortograficzny i zwróć samo poprawione zdanie: \"Wziełem ze sobą parasol, bo miało padać.\"", "answer": "Wziąłem ze sobą parasol, bo miało padać."}
+{"question": "Zamień to zdanie na stronę bierną, zwracając samo zdanie: \"Administrator zrestartował serwer.\"", "answer": "Serwer został zrestartowany przez administratora."}
+{"question": "Wypisz w formacie \"klucz=wartość\", po jednym na linię, dane z tekstu: \"Faktura numer 2024/11/07 na kwotę 1250,00 zł, termin płatności 14 dni.\" Użyj kluczy: numer, kwota, termin.", "answer": "numer=2024/11/07\nkwota=1250,00 zł\ntermin=14 dni"}
+{"question": "Który polski pisarz otrzymał Nagrodę Nobla w dziedzinie literatury w 1996 roku? Podaj samo imię i nazwisko.", "answer": "Wisława Szymborska"}
+{"question": "Napisz dokładnie trzy punkty wypunktowane (używając myślnika) opisujące zalety kopii zapasowych. Każdy punkt maksymalnie pięć słów. Bez wstępu.", "answer": "- Ochrona przed utratą danych\n- Szybkie odtworzenie po awarii\n- Zabezpieczenie przed ransomware"}
+{"question": "Jaki jest dopełniacz liczby mnogiej słowa \"dziecko\"? Odpowiedz jednym słowem.", "answer": "dzieci"}
+{"question": "Rozwiąż i podaj samą liczbę: Jan kupił 3 kilogramy jabłek po 4,50 zł za kilogram i zapłacił banknotem 20 zł. Ile reszty otrzymał w złotych?", "answer": "6,50"}
+{"question": "Zwróć wyłącznie poprawny JSON, tablicę obiektów o kluczach \"produkt\" i \"ilosc\", dla tekstu: \"Zamówienie: 2 klawiatury, 5 myszek.\" Bez bloku kodu.", "answer": "[{\"produkt\": \"klawiatura\", \"ilosc\": 2}, {\"produkt\": \"myszka\", \"ilosc\": 5}]"}
+{"question": "Uzupełnij poprawną formą czasownika i zwróć całe zdanie: \"Wczoraj oni ____ (iść) do kina.\"", "answer": "Wczoraj oni poszli do kina."}
+{"question": "Odpowiedz jednym słowem: jak nazywa się najdłuższa rzeka w Polsce?", "answer": "Wisła"}
+{"question": "Przepisz to zdanie w stylu formalnym, zwracając samo zdanie: \"Hej, dajcie znać jak coś nie działa.\"", "answer": "Uprzejmie proszę o informację w przypadku wystąpienia nieprawidłowości."}
+{"question": "Podaj samą datę w formacie RRRR-MM-DD: trzeci dzień maja dwa tysiące dwudziestego czwartego roku.", "answer": "2024-05-03"}
+{"question": "Ile sylab ma słowo \"nieprawdopodobny\"? Podaj samą liczbę.", "answer": "6"}
+{"question": "Odpowiedz wyłącznie \"tak\" albo \"nie\": czy zdanie \"Poszłem do sklepu\" jest poprawne po polsku?", "answer": "nie"}

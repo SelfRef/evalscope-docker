@@ -1,0 +1,139 @@
+name: Build image
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+    paths:
+      - Dockerfile
+      - scripts/**
+      - suites/**
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - scripts/**
+      - suites/**
+      - .github/workflows/build.yml
+  schedule:
+    # Weekly rebuild, Saturday 21:00 UTC — deliberately well before the start
+    # of the week, so an automated Sunday-morning `docker compose pull` finds a
+    # fresh image with hours to spare even if a scheduled run is delayed.
+    - cron: "0 21 * * 6"
+  workflow_dispatch:
+    inputs:
+      evalscope_version:
+        description: "EvalScope version to pin (empty = Dockerfile default)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pulled by the cloud stack's compose as ghcr.io/selfref/evalscope-docker.
+  PLATFORMS: linux/amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Dockerfile
+        run: docker build --check .
+
+      # GHCR requires lowercase names; github.repository may contain uppercase
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD'}},enable={{is_default_branch}}
+            type=ref,event=tag
+            type=ref,event=pr
+
+      # Build to a local image first so the runtime smoke test below runs on
+      # the EXACT artifact that gets pushed. The Dockerfile's build canaries
+      # already fail the build if a grader cannot be imported; this adds the
+      # checks that need a working container rather than a build step.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          load: true
+          tags: evalscope-docker:ci
+          build-args: |
+            ${{ github.event.inputs.evalscope_version && format('EVALSCOPE_VERSION={0}', github.event.inputs.evalscope_version) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test. These are the failure modes that do NOT surface as an
+      # error at run time — a missing grader dependency scores every sample
+      # zero while the run reports success — so they are gated here as well as
+      # in the Dockerfile.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          run() { docker run --rm -e EVALSCOPE_API_BASE=http://example.invalid:8080 evalscope-docker:ci "$@"; }
+          run quality --list
+          # the {model} placeholder must be substituted into the request path
+          run quality --dry-run -s quality some-model | grep -q '/upstream/some-model/v1/chat/completions'
+          run quality --dry-run -s quality some-model | grep -q '"temperature": 0'
+          # a path template that still contains {model} would send every request
+          # to the same URL and silently evaluate the wrong model.
+          # NB `! grep -q`, not `grep -qv`: -v succeeds when ANY line differs,
+          # which is not the same as "the pattern is absent".
+          ! run quality --dry-run -s quality some-model | grep -q '{model}'
+          run python -c "from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker"
+          run python -c "import nltk; nltk.data.find('tokenizers/punkt_tab/english/')"
+          run python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__"
+          run python -c "import mteb, langdetect, evalscope; print(evalscope.__version__)"
+          echo "smoke test OK"
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ${{ github.event.inputs.evalscope_version && format('EVALSCOPE_VERSION={0}', github.event.inputs.evalscope_version) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### evalscope-docker"
+            echo '```'
+            echo "tags: ${{ steps.meta.outputs.tags }}"
+            docker run --rm evalscope-docker:ci python -c "import evalscope; print('evalscope', evalscope.__version__)" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

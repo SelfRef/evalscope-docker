@@ -1,0 +1,32 @@
+services:
+  evalscope:
+    build: .
+    # `docker compose pull` fetches the CI-built image; `docker compose build` rebuilds locally
+    image: ghcr.io/selfref/evalscope-docker:latest
+    environment:
+      # Base URL of the OpenAI-compatible server under test. Required.
+      EVALSCOPE_API_BASE: "${EVALSCOPE_API_BASE:?set the server URL}"
+      EVALSCOPE_API_KEY: "${EVALSCOPE_API_KEY:-EMPTY}"
+      # Request path; "{model}" is substituted. The default is llama-swap's
+      # per-model route, which bypasses server-side request rewriting so the
+      # eval controls sampling. For a plain single-model OpenAI-compatible
+      # server use /v1/chat/completions instead.
+      EVALSCOPE_API_PATH: "${EVALSCOPE_API_PATH:-/upstream/{model}/v1/chat/completions}"
+      QUALITY_SUITE: "${QUALITY_SUITE:-quality}"
+      QUALITY_LIMIT: "${QUALITY_LIMIT:-250}"
+      # Concurrent requests. Match the server's parallel-slot count.
+      QUALITY_BATCH: "${QUALITY_BATCH:-2}"
+      # Model id used as judge by judged suites. Must NOT be the model under
+      # test (self-preference bias). No default.
+      QUALITY_JUDGE: "${QUALITY_JUDGE:-}"
+    volumes:
+      # Dataset cache + run outputs. The first dataset pull is slow; keep it.
+      - evalscope-data:/data
+      # Optional: shadow the baked-in suites to edit them without a rebuild.
+      # - ./suites:/work/suites:ro
+    # No long-running process — this is a run-on-demand tool:
+    #   docker compose run --rm evalscope quality <model>
+    command: ["sleep", "infinity"]
+
+volumes:
+  evalscope-data:

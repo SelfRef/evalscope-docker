@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""quality — run a correctness evaluation against an OpenAI-compatible endpoint.
+
+Give it a model name:
+
+    quality my-model                     # default suite, default limit
+    quality model-a model-b              # A/B, evaluated one at a time
+    quality -s tools model-a model-b     # tool calling
+    quality -s pl my-model --limit 100   # custom local set, LLM-judged
+    quality --list                       # suites, defaults, resolved config
+    quality --dry-run my-model           # print the evalscope command, run nothing
+
+Configuration comes from the environment:
+
+    EVALSCOPE_API_BASE   base URL of the server under test (required)
+    EVALSCOPE_API_KEY    bearer token                      (default EMPTY)
+    EVALSCOPE_API_PATH   request path template, "{model}" is substituted
+                         (default /upstream/{model}/v1/chat/completions, the
+                         llama-swap per-model path; use /v1/chat/completions
+                         for a plain single-model OpenAI-compatible server)
+    QUALITY_SUITE        default suite                     (default quality)
+    QUALITY_LIMIT        default --limit, PER SUBSET       (default 250)
+    QUALITY_BATCH        default concurrent requests       (default 2)
+    QUALITY_JUDGE        model id used as judge for judged suites (no default)
+    QUALITY_OUTPUT       output root                       (default /data/outputs)
+    QUALITY_SUITES_DIR   custom dataset dir                (default /work/suites)
+
+Why the defaults are what they are:
+
+  * EVALSCOPE_API_PATH defaults to llama-swap's `/upstream/<model>/` route
+    because that route bypasses any server-side request rewriting, so the eval
+    controls the sampling. Pointing at a path where the server can override
+    sampling parameters makes scores irreproducible between runs.
+  * temperature 0 and a fixed seed: a quant or build A/B must not be read
+    through sampling noise.
+  * models are evaluated ONE AT A TIME. Where a server swaps models in and out
+    of limited VRAM, two concurrent runs thrash the weights on every request.
+  * concurrency (--eval-batch-size) is FREE here in a way it is not for speed
+    benchmarking: correctness does not care that requests share a server. Match
+    it to the server's own parallel-slot count.
+  * per-sample errors are NOT ignored by default. `--ignore-errors` is opt-in
+    because a broken grader dependency presents as a run that "succeeds" and
+    scores every sample zero, rather than as a failure.
+
+There is no exclusivity guard: another client using the same server mid-run
+costs wall-clock, not correctness, but long runs still belong on an idle host.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Suites: name -> list of evalscope benchmark ids, plus any extra wiring the
+# suite needs (see build_extra_args).
+# ---------------------------------------------------------------------------
+SUITES = {
+    # Instruction following, grade-school maths, code. All three are graded
+    # objectively (no judge model) and none is saturated for a mid-size model.
+    "quality": ["ifeval", "gsm8k", "humaneval"],
+    # Tool calling. NOTE the benchmark is registered as `bfcl_v3` / `bfcl_v4`,
+    # not `bfcl`. v3 is the version most published numbers quote; v4's extra
+    # subsets (memory_*, web_search_*) need external services.
+    "tools": ["bfcl_v3"],
+    # A local, LLM-judged set from the suites dir. Ships as an example; the
+    # point is to evaluate prompts that look like your own traffic, which no
+    # public benchmark covers. Needs QUALITY_JUDGE.
+    "pl": ["general_qa"],
+    # Reasoning only, for a quick check that does not spend time on code.
+    "reasoning": ["gsm8k"],
+    # Cheap wiring check (~1 min).
+    "smoke": ["gsm8k"],
+}
+
+SMOKE_LIMIT = 5
+JUDGED_SUITES = {"pl"}
+
+
+def env(name, default=""):
+    return os.environ.get(name, "").strip() or default
+
+
+def api_url(base, path_tmpl, model):
+    return base + path_tmpl.replace("{model}", model)
+
+
+def build_extra_args(suite, args, base, path_tmpl, key, suites_dir):
+    """Suite-specific evalscope arguments."""
+    extra = []
+
+    if suite == "tools":
+        # 9 of BFCL v3's 17 subsets. Dropped: java/javascript (most agent
+        # stacks call JSON tools), live_parallel* and the harder multi_turn
+        # variants — `--limit` applies PER SUBSET, so every extra subset costs
+        # a full N. `irrelevance` and `live_irrelevance` are kept deliberately:
+        # refusing to call a tool when none fits is a distinct failure mode,
+        # and a model that scores high there while scoring low elsewhere is
+        # under-calling rather than being careful.
+        extra += ["--dataset-args", json.dumps({"bfcl_v3": {"subset_list": [
+            "simple", "multiple", "parallel", "parallel_multiple",
+            "live_simple", "live_multiple",
+            "irrelevance", "live_irrelevance",
+            "multi_turn_base"]}})]
+
+    elif suite == "pl":
+        extra += ["--dataset-args", json.dumps({
+            "general_qa": {"local_path": suites_dir,
+                           "subset_list": ["pl_starter"]}})]
+        # Judge with a DIFFERENT model than the one under test — judging with
+        # the model under test is self-preference bias. If the server swaps
+        # models within one GPU, prefer a judge that is not in the same
+        # swapping group, or every judged sample costs a model reload.
+        extra += ["--judge", json.dumps({
+            "strategy": "llm",
+            "models": [{
+                "model_id": args.judge,
+                "api_url": api_url(base, path_tmpl, args.judge),
+                "api_key": key,
+                "eval_type": "openai_api",
+                "generation_config": {"temperature": 0, "max_tokens": 512},
+            }],
+        })]
+
+    return extra
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="quality",
+        description="Correctness evaluation of a served model (EvalScope).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("models", nargs="*", metavar="MODEL",
+                    help="model id(s) as the server knows them")
+    ap.add_argument("-s", "--suite", default=env("QUALITY_SUITE", "quality"),
+                    help=f"one of: {', '.join(sorted(SUITES))} (default: %(default)s)")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="max samples PER SUBSET (default: $QUALITY_LIMIT or 250; "
+                         "the `smoke` suite defaults to 5)")
+    ap.add_argument("--datasets", help="override the suite's dataset list (comma-separated)")
+    ap.add_argument("--dataset-args", help="raw evalscope --dataset-args JSON (overrides the suite's)")
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="concurrent requests (default: $QUALITY_BATCH or 2). Match the "
+                         "server's parallel-slot count; more than that only queues.")
+    ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--judge", default=env("QUALITY_JUDGE"),
+                    help="model id used as LLM judge for judged suites "
+                         "(default: $QUALITY_JUDGE)")
+    ap.add_argument("--tag", default="", help="suffix for the report model-id")
+    ap.add_argument("--ignore-errors", action="store_true",
+                    help="continue past per-sample failures. OFF by default: it hides a "
+                         "broken grader as a run of silently zero-scored samples.")
+    ap.add_argument("--use-cache", metavar="DIR",
+                    help="previous output dir to resume from; reuses cached predictions "
+                         "(the expensive part) and only re-runs scoring. Use after a "
+                         "GRADER fix — costs no inference. Rewrites reviews IN PLACE.")
+    ap.add_argument("--rerun-review", action="store_true",
+                    help="with --use-cache, force re-scoring instead of reusing reviews.")
+    ap.add_argument("--list", action="store_true", help="show suites and resolved config, then exit")
+    ap.add_argument("--dry-run", action="store_true", help="print the evalscope command(s) and exit")
+    args = ap.parse_args()
+
+    base = env("EVALSCOPE_API_BASE").rstrip("/")
+    path_tmpl = env("EVALSCOPE_API_PATH", "/upstream/{model}/v1/chat/completions")
+    key = env("EVALSCOPE_API_KEY", "EMPTY")
+    out_root = env("QUALITY_OUTPUT", "/data/outputs")
+    suites_dir = env("QUALITY_SUITES_DIR", "/work/suites")
+
+    if args.list:
+        print(f"api base   : {base or 'NOT SET (set EVALSCOPE_API_BASE)'}")
+        print(f"api path   : {path_tmpl}")
+        print(f"api key    : {'set' if key != 'EMPTY' else 'not set'}")
+        print(f"output     : {out_root}")
+        print(f"suites dir : {suites_dir}")
+        print(f"judge      : {args.judge or 'not set (needed by: ' + ', '.join(sorted(JUDGED_SUITES)) + ')'}")
+        print(f"defaults   : suite={args.suite}  limit={env('QUALITY_LIMIT', '250')}  "
+              f"batch={env('QUALITY_BATCH', '2')}")
+        print("\nsuites:")
+        for name, ds in sorted(SUITES.items()):
+            note = f"  (limit {SMOKE_LIMIT})" if name == "smoke" else ""
+            note += "  [needs a judge]" if name in JUDGED_SUITES else ""
+            print(f"  {name:<10} {', '.join(ds)}{note}")
+        return 0
+
+    if args.suite not in SUITES:
+        ap.error(f"unknown suite {args.suite!r}; choose from {', '.join(sorted(SUITES))}")
+    if not args.models:
+        ap.error("give at least one model id (or --list)")
+    if not base:
+        ap.error("EVALSCOPE_API_BASE is not set — point it at the server under test")
+    if args.suite in JUDGED_SUITES and not args.judge and not args.dataset_args:
+        ap.error(f"suite {args.suite!r} is LLM-judged: set QUALITY_JUDGE (or --judge) "
+                 f"to a model OTHER than the one under test")
+
+    limit = args.limit
+    if limit is None:
+        limit = SMOKE_LIMIT if args.suite == "smoke" else int(env("QUALITY_LIMIT", "250"))
+    batch = args.batch_size or int(env("QUALITY_BATCH", "2"))
+    datasets = args.datasets.split(",") if args.datasets else SUITES[args.suite]
+
+    rc = 0
+    for entry in args.models:
+        model_id = f"{entry}{args.tag}"
+        cmd = [
+            "evalscope", "eval",
+            "--model", entry,
+            "--model-id", model_id,
+            "--api-url", api_url(base, path_tmpl, entry),
+            "--api-key", key,
+            "--eval-type", "openai_api",
+            "--datasets", *datasets,
+            "--limit", str(limit),
+            "--eval-batch-size", str(batch),
+            "--generation-config", json.dumps(
+                {"temperature": 0, "top_p": 1, "seed": 42, "max_tokens": args.max_tokens}),
+            "--seed", "42",
+            "--timeout", "1800",
+            "--work-dir", f"{out_root}/{args.suite}",
+        ]
+        if args.dataset_args:
+            cmd += ["--dataset-args", args.dataset_args]
+        else:
+            cmd += build_extra_args(args.suite, args, base, path_tmpl, key, suites_dir)
+        if args.ignore_errors:
+            cmd.append("--ignore-errors")
+        if args.use_cache:
+            cmd += ["--use-cache", args.use_cache]
+            if args.rerun_review:
+                cmd.append("--rerun-review")
+
+        if args.dry_run:
+            print(" ".join("***" if i and cmd[i - 1] == "--api-key" else c
+                           for i, c in enumerate(cmd)))
+            continue
+
+        print(f"\n=== {model_id}: {','.join(datasets)} (limit {limit}) ===", flush=True)
+        t0 = time.time()
+        r = subprocess.run(cmd)
+        print(f"=== {model_id} finished in {time.time() - t0:.0f}s (rc={r.returncode}) ===",
+              flush=True)
+        rc = rc or r.returncode
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,27 @@
+{
+  "eval_backend": "RAGEval",
+  "eval_config": {
+    "tool": "mteb",
+    "eval": {
+      "task_names": [
+        "PolEmo2.0-IN.v2",
+        "PolEmo2.0-OUT.v2",
+        "AllegroReviews.v2",
+        "CBD.v2",
+        "PAC.v2"
+      ],
+      "output_folder": "/data/outputs/embed",
+      "overwrite_results": true
+    },
+    "models": [
+      {
+        "model_name": "EMBEDDING_MODEL_ID",
+        "api_base": "http://SERVER:PORT/upstream/EMBEDDING_MODEL_ID/v1",
+        "api_key": "API_KEY",
+        "encode_kwargs": {
+          "batch_size": 16
+        }
+      }
+    ]
+  }
+}
