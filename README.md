@@ -39,9 +39,19 @@ quality model-a model-b              # A/B — evaluated one at a time, never co
 quality -s tools model-a             # tool calling (BFCL v3)
 quality -s pl my-model --limit 100   # local judged set from the suites dir
 quality -s smoke my-model            # ~1 min wiring check
+quality -s ifeval my-model           # ONE benchmark — no suite needed
+quality -s ifeval,gsm8k my-model     # an ad-hoc combination
 quality --list                       # suites + resolved configuration
+quality --list-datasets              # every benchmark id evalscope has registered
 quality --dry-run -s tools my-model  # print the evalscope command, run nothing
 ```
+
+`-s` takes either a suite name or benchmark ids, comma-separated: the suites below are
+shorthands for combinations worth re-running, not the set of things that can be run. Any of
+the 250-odd ids from `--list-datasets` works, and per-dataset wiring (BFCL subsets, the local
+`general_qa` set and its judge) follows the dataset either way. An ad-hoc run writes to its own
+`outputs/<ids>/` directory, so it never lands in a suite's report tree; a mistyped id is caught
+against the registry *before* a model is loaded.
 
 | suite | datasets | notes |
 |---|---|---|

@@ -7,7 +7,10 @@ Give it a model name:
     quality model-a model-b              # A/B, evaluated one at a time
     quality -s tools model-a model-b     # tool calling
     quality -s pl my-model --limit 100   # custom local set, LLM-judged
+    quality -s ifeval my-model           # ONE benchmark, no suite needed
+    quality -s ifeval,gsm8k my-model     # an ad-hoc combination
     quality --list                       # suites, defaults, resolved config
+    quality --list-datasets              # every benchmark id evalscope knows
     quality --dry-run my-model           # print the evalscope command, run nothing
 
 Configuration comes from the environment:
@@ -46,6 +49,7 @@ There is no exclusivity guard: another client using the same server mid-run
 costs wall-clock, not correctness, but long runs still belong on an idle host.
 """
 import argparse
+import difflib
 import json
 import os
 import subprocess
@@ -53,8 +57,11 @@ import sys
 import time
 
 # ---------------------------------------------------------------------------
-# Suites: name -> list of evalscope benchmark ids, plus any extra wiring the
-# suite needs (see build_extra_args).
+# Suites: name -> list of evalscope benchmark ids. A suite is a shorthand for a
+# combination worth re-running, NOT the set of things that can be run: `-s`
+# also takes benchmark ids directly (`-s ifeval`, `-s ifeval,gsm8k`), which is
+# how a single test is run without editing this file. `--list-datasets` prints
+# every id evalscope has registered.
 # ---------------------------------------------------------------------------
 SUITES = {
     # Instruction following, grade-school maths, code. All three are graded
@@ -75,7 +82,59 @@ SUITES = {
 }
 
 SMOKE_LIMIT = 5
-JUDGED_SUITES = {"pl"}
+
+# Datasets that need an LLM judge rather than an objective grader.
+JUDGED_DATASETS = {"general_qa"}
+
+
+def dataset_args_for(dataset, suites_dir):
+    """The --dataset-args entry a dataset needs, or None.
+
+    Keyed by DATASET, not by suite, so the wiring follows the dataset whether
+    it arrives through a suite or is named directly on `-s`.
+    """
+    if dataset in ("bfcl_v3", "bfcl_v4"):
+        # 9 of BFCL v3's 17 subsets. Dropped: java/javascript (most agent
+        # stacks call JSON tools), live_parallel* and the harder multi_turn
+        # variants — `--limit` applies PER SUBSET, so every extra subset costs
+        # a full N. `irrelevance` and `live_irrelevance` are kept deliberately:
+        # refusing to call a tool when none fits is a distinct failure mode,
+        # and a model that scores high there while scoring low elsewhere is
+        # under-calling rather than being careful.
+        return {"subset_list": [
+            "simple", "multiple", "parallel", "parallel_multiple",
+            "live_simple", "live_multiple",
+            "irrelevance", "live_irrelevance",
+            "multi_turn_base"]}
+    if dataset == "general_qa":
+        return {"local_path": suites_dir, "subset_list": ["pl_starter"]}
+    return None
+
+
+def resolve_suite(name):
+    """(label, datasets) for a suite name or a comma-separated id list.
+
+    The label names the work-dir, so a one-off `-s ifeval` keeps its reports
+    out of the tree a full suite writes to.
+    """
+    if name in SUITES:
+        return name, list(SUITES[name])
+    datasets = [d.strip() for d in name.split(",") if d.strip()]
+    return "+".join(datasets), datasets
+
+
+def known_datasets():
+    """Benchmark ids evalscope has registered, or None if they cannot be read.
+
+    The import costs ~3 s, so it runs only when an id was typed by hand: a typo
+    there would otherwise surface as an evalscope traceback a few seconds into
+    what looked like a started run.
+    """
+    try:
+        from evalscope.api.registry import BENCHMARK_REGISTRY
+        return set(BENCHMARK_REGISTRY)
+    except Exception:
+        return None
 
 
 def env(name, default=""):
@@ -86,28 +145,20 @@ def api_url(base, path_tmpl, model):
     return base + path_tmpl.replace("{model}", model)
 
 
-def build_extra_args(suite, args, base, path_tmpl, key, suites_dir):
-    """Suite-specific evalscope arguments."""
+def build_extra_args(datasets, args, base, path_tmpl, key, suites_dir):
+    """Dataset-specific evalscope arguments for this run.
+
+    evalscope takes a SINGLE --dataset-args object, so the per-dataset entries
+    are merged into one.
+    """
     extra = []
 
-    if suite == "tools":
-        # 9 of BFCL v3's 17 subsets. Dropped: java/javascript (most agent
-        # stacks call JSON tools), live_parallel* and the harder multi_turn
-        # variants — `--limit` applies PER SUBSET, so every extra subset costs
-        # a full N. `irrelevance` and `live_irrelevance` are kept deliberately:
-        # refusing to call a tool when none fits is a distinct failure mode,
-        # and a model that scores high there while scoring low elsewhere is
-        # under-calling rather than being careful.
-        extra += ["--dataset-args", json.dumps({"bfcl_v3": {"subset_list": [
-            "simple", "multiple", "parallel", "parallel_multiple",
-            "live_simple", "live_multiple",
-            "irrelevance", "live_irrelevance",
-            "multi_turn_base"]}})]
+    ds_args = {d: a for d in datasets
+               for a in [dataset_args_for(d, suites_dir)] if a}
+    if ds_args:
+        extra += ["--dataset-args", json.dumps(ds_args)]
 
-    elif suite == "pl":
-        extra += ["--dataset-args", json.dumps({
-            "general_qa": {"local_path": suites_dir,
-                           "subset_list": ["pl_starter"]}})]
+    if any(d in JUDGED_DATASETS for d in datasets):
         # Judge with a DIFFERENT model than the one under test — judging with
         # the model under test is self-preference bias. If the server swaps
         # models within one GPU, prefer a judge that is not in the same
@@ -134,7 +185,9 @@ def main():
     ap.add_argument("models", nargs="*", metavar="MODEL",
                     help="model id(s) as the server knows them")
     ap.add_argument("-s", "--suite", default=env("QUALITY_SUITE", "quality"),
-                    help=f"one of: {', '.join(sorted(SUITES))} (default: %(default)s)")
+                    help=f"suite ({', '.join(sorted(SUITES))}) or benchmark id(s), "
+                         f"comma-separated, e.g. ifeval or ifeval,gsm8k "
+                         f"(default: %(default)s)")
     ap.add_argument("--limit", type=int, default=None,
                     help="max samples PER SUBSET (default: $QUALITY_LIMIT or 250; "
                          "the `smoke` suite defaults to 5)")
@@ -158,6 +211,9 @@ def main():
     ap.add_argument("--rerun-review", action="store_true",
                     help="with --use-cache, force re-scoring instead of reusing reviews.")
     ap.add_argument("--list", action="store_true", help="show suites and resolved config, then exit")
+    ap.add_argument("--list-datasets", action="store_true",
+                    help="list every benchmark id evalscope has registered "
+                         "(any of them is usable with -s), then exit")
     ap.add_argument("--dry-run", action="store_true", help="print the evalscope command(s) and exit")
     args = ap.parse_args()
 
@@ -173,31 +229,61 @@ def main():
         print(f"api key    : {'set' if key != 'EMPTY' else 'not set'}")
         print(f"output     : {out_root}")
         print(f"suites dir : {suites_dir}")
-        print(f"judge      : {args.judge or 'not set (needed by: ' + ', '.join(sorted(JUDGED_SUITES)) + ')'}")
+        judged = sorted(n for n, ds in SUITES.items()
+                        if any(d in JUDGED_DATASETS for d in ds))
+        print(f"judge      : {args.judge or 'not set (needed by: ' + ', '.join(judged) + ')'}")
         print(f"defaults   : suite={args.suite}  limit={env('QUALITY_LIMIT', '250')}  "
               f"batch={env('QUALITY_BATCH', '2')}")
         print("\nsuites:")
         for name, ds in sorted(SUITES.items()):
             note = f"  (limit {SMOKE_LIMIT})" if name == "smoke" else ""
-            note += "  [needs a judge]" if name in JUDGED_SUITES else ""
+            note += "  [needs a judge]" if any(d in JUDGED_DATASETS for d in ds) else ""
             print(f"  {name:<10} {', '.join(ds)}{note}")
+        print("\n-s also takes benchmark ids directly: -s ifeval, -s ifeval,gsm8k")
+        print("--list-datasets shows every id evalscope knows")
         return 0
 
-    if args.suite not in SUITES:
-        ap.error(f"unknown suite {args.suite!r}; choose from {', '.join(sorted(SUITES))}")
+    if args.list_datasets:
+        names = known_datasets()
+        if names is None:
+            print("error: could not read evalscope's benchmark registry", file=sys.stderr)
+            return 1
+        for name in sorted(names):
+            print(name)
+        return 0
+
+    label, datasets = resolve_suite(args.suite)
+    if args.datasets:
+        datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    if not datasets:
+        ap.error("no datasets — -s takes a suite name or benchmark id(s)")
+
+    # Ids that came from a suite are known-good; anything typed by hand is
+    # checked against evalscope's registry BEFORE a model is loaded.
+    if args.suite not in SUITES or args.datasets:
+        names = known_datasets()
+        if names is not None:
+            unknown = [d for d in datasets if d not in names]
+            if unknown:
+                near = dict.fromkeys(m for d in unknown
+                                     for m in difflib.get_close_matches(d, names, 3))
+                hint = f"; did you mean {', '.join(near)}?" if near else ""
+                ap.error(f"unknown suite or benchmark id: {', '.join(unknown)}{hint}\n"
+                         f"  suites: {', '.join(sorted(SUITES))}\n"
+                         f"  --list-datasets shows every benchmark id")
+
     if not args.models:
         ap.error("give at least one model id (or --list)")
     if not base:
         ap.error("EVALSCOPE_API_BASE is not set — point it at the server under test")
-    if args.suite in JUDGED_SUITES and not args.judge and not args.dataset_args:
-        ap.error(f"suite {args.suite!r} is LLM-judged: set QUALITY_JUDGE (or --judge) "
-                 f"to a model OTHER than the one under test")
+    if any(d in JUDGED_DATASETS for d in datasets) and not args.judge and not args.dataset_args:
+        ap.error(f"{', '.join(sorted(JUDGED_DATASETS & set(datasets)))} is LLM-judged: "
+                 f"set QUALITY_JUDGE (or --judge) to a model OTHER than the one under test")
 
     limit = args.limit
     if limit is None:
         limit = SMOKE_LIMIT if args.suite == "smoke" else int(env("QUALITY_LIMIT", "250"))
     batch = args.batch_size or int(env("QUALITY_BATCH", "2"))
-    datasets = args.datasets.split(",") if args.datasets else SUITES[args.suite]
 
     rc = 0
     for entry in args.models:
@@ -216,12 +302,12 @@ def main():
                 {"temperature": 0, "top_p": 1, "seed": 42, "max_tokens": args.max_tokens}),
             "--seed", "42",
             "--timeout", "1800",
-            "--work-dir", f"{out_root}/{args.suite}",
+            "--work-dir", f"{out_root}/{label}",
         ]
         if args.dataset_args:
             cmd += ["--dataset-args", args.dataset_args]
         else:
-            cmd += build_extra_args(args.suite, args, base, path_tmpl, key, suites_dir)
+            cmd += build_extra_args(datasets, args, base, path_tmpl, key, suites_dir)
         if args.ignore_errors:
             cmd.append("--ignore-errors")
         if args.use_cache:
@@ -230,7 +316,11 @@ def main():
                 cmd.append("--rerun-review")
 
         if args.dry_run:
-            print(" ".join("***" if i and cmd[i - 1] == "--api-key" else c
+            # The key appears both as --api-key and, for judged runs, inside
+            # the --judge JSON; mask BOTH, or a dry-run pasted into a report
+            # leaks the token.
+            print(" ".join("***" if i and cmd[i - 1] == "--api-key"
+                           else (c.replace(key, "***") if key != "EMPTY" else c)
                            for i, c in enumerate(cmd)))
             continue
 
