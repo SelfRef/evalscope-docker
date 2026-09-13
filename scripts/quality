@@ -5,6 +5,7 @@ Give it a model name:
 
     quality my-model                     # default suite, default limit
     quality model-a model-b              # A/B, evaluated one at a time
+    quality -s fast model-a model-b      # one benchmark, for a quick ranking
     quality -s tools model-a model-b     # tool calling
     quality -s pl my-model --limit 100   # custom local set, LLM-judged
     quality -s ifeval my-model           # ONE benchmark, no suite needed
@@ -24,7 +25,7 @@ Configuration comes from the environment:
     QUALITY_SUITE        default suite                     (default quality)
     QUALITY_LIMIT        default --limit, PER SUBSET       (default 250)
     QUALITY_BATCH        default concurrent requests       (default 2)
-    QUALITY_JUDGE        model id used as judge for judged suites (no default)
+    QUALITY_JUDGE        model id used as LLM judge for judged suites (no default)
     QUALITY_OUTPUT       output root                       (default /data/outputs)
     QUALITY_SUITES_DIR   custom dataset dir                (default /work/suites)
 
@@ -44,17 +45,28 @@ Why the defaults are what they are:
   * per-sample errors are NOT ignored by default. `--ignore-errors` is opt-in
     because a broken grader dependency presents as a run that "succeeds" and
     scores every sample zero, rather than as a failure.
+  * the model ids are checked against the server's /v1/models BEFORE anything
+    is loaded. Without that, a typo (or a suite name typed where a model goes)
+    becomes five retries and a full openai.NotFoundError traceback per sample.
+  * output is a RESULT, not a log. evalscope's INFO stream, config dump,
+    progress bars and perf tables are filtered out; what is left is progress,
+    anything that went wrong, and a score table. `-v` restores the raw stream.
 
 There is no exclusivity guard: another client using the same server mid-run
 costs wall-clock, not correctness, but long runs still belong on an idle host.
 """
 import argparse
+import collections
 import difflib
+import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Suites: name -> list of evalscope benchmark ids. A suite is a shorthand for a
@@ -67,6 +79,19 @@ SUITES = {
     # Instruction following, grade-school maths, code. All three are graded
     # objectively (no judge model) and none is saturated for a mid-size model.
     "quality": ["ifeval", "gsm8k", "humaneval"],
+    # ONE benchmark, for ranking several models without spending an evening on
+    # it: ~1/4 of the default suite's samples. humaneval and not the other two,
+    # for three reasons. (1) It is the one that MOVES: in the runs this harness
+    # has produced, gsm8k sat at 96-98 % for every mid-size model (saturated —
+    # a test with no headroom cannot rank anything) and ifeval came back
+    # statistically identical between builds that differ elsewhere. (2) Its n
+    # is FIXED at 164, so there is no --limit to pick, defend, or forget to
+    # keep equal across arms. (3) It is objectively graded: no judge model, so
+    # no second model swapping in and out of VRAM mid-run.
+    # It measures code generation in English and nothing else — for the agent
+    # role use `tools`, and for a broader picture the `quality` suite is still
+    # the one to report.
+    "fast": ["humaneval"],
     # Tool calling. NOTE the benchmark is registered as `bfcl_v3` / `bfcl_v4`,
     # not `bfcl`. v3 is the version most published numbers quote; v4's extra
     # subsets (memory_*, web_search_*) need external services.
@@ -85,6 +110,11 @@ SMOKE_LIMIT = 5
 
 # Datasets that need an LLM judge rather than an objective grader.
 JUDGED_DATASETS = {"general_qa"}
+
+# Per-sample request timeout, seconds. Goes inside --generation-config: the
+# top-level --timeout flag is deprecated in evalscope 1.11 and warns on every
+# single run.
+REQUEST_TIMEOUT = 1800
 
 
 def dataset_args_for(dataset, suites_dir):
@@ -137,6 +167,25 @@ def known_datasets():
         return None
 
 
+def served_models(base, key, timeout=10):
+    """Model ids the server advertises, or None if it will not say.
+
+    None means "could not check" — a server without /v1/models, an auth
+    failure, a proxy that lists nothing. That is NOT an error: the check exists
+    to catch typos cheaply, not to be the authority on what is servable.
+    """
+    req = urllib.request.Request(base.rstrip("/") + "/v1/models")
+    if key and key != "EMPTY":
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.load(r)
+        ids = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+        return ids or None
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return None
+
+
 def env(name, default=""):
     return os.environ.get(name, "").strip() or default
 
@@ -177,6 +226,321 @@ def build_extra_args(datasets, args, base, path_tmpl, key, suites_dir):
     return extra
 
 
+# ---------------------------------------------------------------------------
+# Output. evalscope logs at INFO and draws nested tqdm bars, which on a
+# non-interactive stdout (a redirect, a CI job, `docker compose run`) produces
+# hundreds of near-identical lines per run and buries the one line that says
+# something went wrong. The wrapper filters that down to: progress, problems,
+# scores. `-v` turns the filter off.
+# ---------------------------------------------------------------------------
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# "Evaluating[gsm8k]:  40%|####  | 2/5 [00:08<00:10,  3.47s/it]". Only the
+# inner (per-dataset) bar is of interest; the outer "Running[eval] 0/1
+# benchmark" bar counts BENCHMARKS and sits at 0 for the whole run, so showing
+# both just doubles the lines and interleaves two counters that never agree.
+PROGRESS_RE = re.compile(r"Evaluating\[([^\]]+)\][: ]\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)")
+# The same counter as evalscope logs it once a minute: "Evaluating[gsm8k]  20%|
+# 1/5 [Elapsed: 01:00 < Remaining: ...]". One pipe, not two, so it needs its own
+# pattern — and it is the only thing that arrives at all while a sample is
+# stuck, which is what makes a stalled run distinguishable from a dead one.
+PROGRESS_LOG_RE = re.compile(r"Evaluating\[([^\]]+)\]\s+\d+%\|\s*(\d+)/(\d+)\s*\[Elapsed")
+LEVEL_RE = re.compile(r"\b(WARNING|ERROR|CRITICAL)\b[: ]\s*(.*)$")
+# The last line of a python traceback, which is the only line of it worth
+# showing: "openai.NotFoundError: Error code: 404 - {...}".
+EXC_RE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Interrupt))(?::\s*(.*))?$")
+# Warnings this wrapper causes on purpose and already reports itself.
+MUTED = (
+    "samples to evaluate",          # our own --limit, printed in the header
+    "Remove `--limit`",
+)
+# INFO lines worth keeping. Between starting and the first answered sample a
+# run can spend minutes importing graders and pulling a dataset; with the log
+# filtered out that is an empty screen, which reads as a hang — and a hang is
+# exactly what it might be, so the phases have to be visible.
+MILESTONES = (
+    "Start loading benchmark dataset",
+    "Downloading",
+    "aggregating scores",
+)
+LOG_PREFIX_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+-\s+\S+\s+-\s+\w+:\s*")
+
+
+def _short(msg, width=160):
+    msg = msg.strip()
+    return msg if len(msg) <= width else msg[:width - 1] + "…"
+
+
+class Filter:
+    """Turns evalscope's stream into progress + problems."""
+
+    def __init__(self, out=sys.stdout):
+        self.out = out
+        self.tty = out.isatty()
+        self.seen = set()
+        self.tail = collections.deque(maxlen=80)
+        self.problems = 0
+        self.status = ""
+        self.last_draw = 0.0
+        # Per-bar state: tqdm redraws the same frame many times, so progress is
+        # printed only when the COUNT actually moves.
+        self.bars = {}
+
+    def _clear(self):
+        if self.tty and self.status:
+            self.out.write("\r" + " " * len(self.status) + "\r")
+            self.status = ""
+
+    def note(self, mark, msg):
+        key = (mark, msg)
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        self._clear()
+        self.out.write(f"  {mark} {msg}\n")
+        self.out.flush()
+
+    def progress(self, name, done, total):
+        now = time.time()
+        pct = int(100 * done / total) if total else 0
+        last_done, last_pct, last_time = self.bars.get(name, (-1, -101, 0.0))
+        stale = now - last_time >= 60
+        if done == last_done and not stale:
+            return
+        line = f"  · {name}: {done}/{total}"
+        if self.tty:
+            if now - self.last_draw < 0.5 and done != total:
+                return
+            pad = max(0, len(self.status) - len(line))
+            self.out.write("\r" + line + " " * pad)
+            self.out.flush()
+            self.status = line
+        else:
+            # No cursor to move, so every update is a new line: print one per
+            # 10 % of progress (or per minute on a slow benchmark), enough to
+            # show the run is alive without scrolling the result off the top.
+            if done != total and not stale and pct - last_pct < 10:
+                return
+            self.out.write(line + "\n")
+            self.out.flush()
+        self.bars[name] = (done, pct, now)
+        self.last_draw = now
+
+    def feed(self, raw):
+        line = ANSI_RE.sub("", raw).strip()
+        if not line:
+            return
+        self.tail.append(line)
+
+        m = PROGRESS_RE.search(line) or PROGRESS_LOG_RE.search(line)
+        if m:
+            self.progress(m.group(1), int(m.group(2)), int(m.group(3)))
+            return
+
+        m = LEVEL_RE.search(line)
+        if m:
+            level, msg = m.group(1), m.group(2)
+            if any(s in msg for s in MUTED):
+                return
+            self.problems += 1 if level != "WARNING" else 0
+            self.note("!" if level == "WARNING" else "✗", _short(msg))
+            return
+
+        m = EXC_RE.match(line)
+        if m:
+            self.problems += 1
+            self.note("✗", _short(line))
+            return
+
+        msg = LOG_PREFIX_RE.sub("", line)
+        if any(s in msg for s in MILESTONES):
+            self.note("·", _short(msg))
+        # everything else is INFO noise: the config dump, the report tables
+        # (re-rendered below from the report JSON), the perf tables.
+
+    def finish(self):
+        self._clear()
+
+
+def run_eval(cmd, verbose):
+    """Run evalscope. Returns (returncode, Filter or None)."""
+    if verbose:
+        return subprocess.run(cmd).returncode, None
+
+    filt = Filter()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, bufsize=0)
+    buf = b""
+    try:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            # tqdm separates frames with \r, the logger with \n. Split on both.
+            parts = re.split(rb"[\r\n]", buf)
+            buf = parts.pop()
+            for part in parts:
+                filt.feed(part.decode("utf-8", "replace"))
+        if buf:
+            filt.feed(buf.decode("utf-8", "replace"))
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        filt.finish()
+        raise
+    filt.finish()
+    return rc, filt
+
+
+# ---------------------------------------------------------------------------
+# Reports. evalscope writes one JSON per dataset under <run>/reports/<model>/;
+# it is the same data as its own report table, minus the log around it, and it
+# is what makes a cross-model table possible at the end of an A/B.
+# ---------------------------------------------------------------------------
+def metric_label(metric):
+    ident = metric.get("identity") or {}
+    sem = metric.get("semantics") or {}
+    name = sem.get("display_name") or sem.get("metric_name") or ident.get("name", "score")
+    agg = ident.get("aggregation") or ""
+    dims = ident.get("dimensions") or {}
+    if agg == "pass_at_k":
+        k = dims.get("k", "k")
+        # evalscope already calls the metric "Pass@k"; appending "pass@1" to
+        # that gives "Pass@k pass@1".
+        return re.sub(r"@k$", f"@{k}", name) if name.lower().endswith("@k") else f"{name} pass@{k}"
+    if agg and agg != "mean":
+        return f"{name} ({agg})"
+    return name
+
+
+def fmt_score(score, metric):
+    sem = metric.get("semantics") or {}
+    mult = sem.get("display_multiplier") or 1
+    prec = sem.get("display_precision")
+    prec = 1 if prec is None else prec
+    unit = sem.get("display_unit") or ""
+    return f"{score * mult:.{prec}f} {unit}".strip()
+
+
+def read_reports(run_dir, model_id):
+    """[(dataset, metric, subset, score_str, n)] for one finished run.
+
+    Subset rows are emitted only for multi-subset datasets (BFCL), where the
+    per-subset numbers are the point; a single-subset dataset would otherwise
+    print every row twice.
+    """
+    rows = []
+    for path in sorted(glob.glob(os.path.join(run_dir, "reports", model_id, "*.json"))):
+        try:
+            with open(path) as fh:
+                rep = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        dataset = rep.get("dataset_pretty_name") or rep.get("dataset_name") or \
+            os.path.splitext(os.path.basename(path))[0]
+        for metric in rep.get("metrics", []):
+            label = metric_label(metric)
+            rows.append((dataset, label, "", fmt_score(metric.get("score", 0), metric),
+                         metric.get("num", 0)))
+            subsets = [s for cat in metric.get("categories", [])
+                       for s in cat.get("subsets", [])]
+            if len(subsets) > 1:
+                for sub in subsets:
+                    rows.append((dataset, label, sub.get("name", "?"),
+                                 fmt_score(sub.get("score", 0), metric), sub.get("num", 0)))
+    return rows
+
+
+def print_table(headers, rows, aligns, out=sys.stdout):
+    if not rows:
+        return
+    widths = [max(len(str(h)), *(len(str(r[i])) for r in rows))
+              for i, h in enumerate(headers)]
+    def line(cells):
+        return "  ".join(
+            str(c).rjust(w) if a == "r" else str(c).ljust(w)
+            for c, w, a in zip(cells, widths, aligns)).rstrip()
+    out.write(line(headers) + "\n")
+    out.write("  ".join("-" * w for w in widths).rstrip() + "\n")
+    for row in rows:
+        out.write(line(row) + "\n")
+
+
+def print_results(results):
+    """One table for one model, a model-per-column pivot for several."""
+    models = [m for m, rows in results.items() if rows]
+    if not models:
+        return
+    print()
+    if len(models) == 1:
+        rows = [(ds, mt, sub or "—", n, score)
+                for ds, mt, sub, score, n in results[models[0]]]
+        print_table(["dataset", "metric", "subset", "n", models[0]],
+                    rows, ["l", "l", "l", "r", "r"])
+        return
+
+    # Pivot: one row per (dataset, metric, subset), one column per model. Keys
+    # keep the order of the first model that produced them.
+    keys = list(dict.fromkeys(k for m in models for k in
+                              [(ds, mt, sub) for ds, mt, sub, _, _ in results[m]]))
+    cells = {(m, (ds, mt, sub)): (score, n)
+             for m in models for ds, mt, sub, score, n in results[m]}
+    ns = {n for _, n in cells.values()}
+    same_n = len(ns) == 1
+    rows = []
+    for key in keys:
+        row = [key[0], key[1], key[2] or "—"]
+        if same_n:
+            row.append(next(iter(ns)))
+        for m in models:
+            score, n = cells.get((m, key), ("—", 0))
+            # An n that differs between arms is not a footnote — it decides
+            # whether the two numbers may be compared at all, so it goes in
+            # the cell rather than a note under the table.
+            row.append(score if same_n else f"{score} (n={n})")
+        rows.append(row)
+    headers = ["dataset", "metric", "subset"] + (["n"] if same_n else []) + models
+    aligns = ["l", "l", "l"] + (["r"] if same_n else []) + ["r"] * len(models)
+    print_table(headers, rows, aligns)
+
+
+def parse_batch(spec, default):
+    """(default, {model: n}) from `4`, `a=4,b=2` or `4,b=2`.
+
+    A server that swaps models often serves them with different parallel-slot
+    counts, and a caller that has to split those into one run per model loses
+    the cross-model table — which is the whole output of an A/B.
+    """
+    per = {}
+    base = default
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        model, _, value = part.rpartition("=")
+        try:
+            if model:
+                per[model.strip()] = int(value)
+            else:
+                base = int(value)
+        except ValueError:
+            raise ValueError(f"not a batch size: {part!r}")
+    return base, per
+
+
+def hms(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="quality",
@@ -193,9 +557,12 @@ def main():
                          "the `smoke` suite defaults to 5)")
     ap.add_argument("--datasets", help="override the suite's dataset list (comma-separated)")
     ap.add_argument("--dataset-args", help="raw evalscope --dataset-args JSON (overrides the suite's)")
-    ap.add_argument("--batch-size", type=int, default=None,
+    ap.add_argument("--batch-size", default=None, metavar="N|MODEL=N,...",
                     help="concurrent requests (default: $QUALITY_BATCH or 2). Match the "
-                         "server's parallel-slot count; more than that only queues.")
+                         "server's parallel-slot count; more than that only queues. "
+                         "Accepts per-model pairs (`a=4,b=2`) so models with different "
+                         "slot counts can still be evaluated in ONE run, which is what "
+                         "produces the cross-model table.")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--judge", default=env("QUALITY_JUDGE"),
                     help="model id used as LLM judge for judged suites "
@@ -210,6 +577,12 @@ def main():
                          "GRADER fix — costs no inference. Rewrites reviews IN PLACE.")
     ap.add_argument("--rerun-review", action="store_true",
                     help="with --use-cache, force re-scoring instead of reusing reviews.")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="stream evalscope's own output (INFO log, progress bars, its "
+                         "report and perf tables) instead of progress + scores.")
+    ap.add_argument("--skip-model-check", action="store_true",
+                    help="do not verify the model ids against the server's /v1/models "
+                         "first (for a server whose served ids differ from its routes).")
     ap.add_argument("--list", action="store_true", help="show suites and resolved config, then exit")
     ap.add_argument("--list-datasets", action="store_true",
                     help="list every benchmark id evalscope has registered "
@@ -238,6 +611,7 @@ def main():
         for name, ds in sorted(SUITES.items()):
             note = f"  (limit {SMOKE_LIMIT})" if name == "smoke" else ""
             note += "  [needs a judge]" if any(d in JUDGED_DATASETS for d in ds) else ""
+            note += "  [quick A/B: fixed n=164, code only]" if name == "fast" else ""
             print(f"  {name:<10} {', '.join(ds)}{note}")
         print("\n-s also takes benchmark ids directly: -s ifeval, -s ifeval,gsm8k")
         print("--list-datasets shows every id evalscope knows")
@@ -280,14 +654,57 @@ def main():
         ap.error(f"{', '.join(sorted(JUDGED_DATASETS & set(datasets)))} is LLM-judged: "
                  f"set QUALITY_JUDGE (or --judge) to a model OTHER than the one under test")
 
+    # A suite name where a model id belongs (`quality my-model` read as two
+    # models) is the easy mistake, because it is what the docs' first example
+    # looks like with one word moved. Caught before the network check so the
+    # message can say what the user actually meant.
+    suite_as_model = [m for m in args.models if m in SUITES]
+    if suite_as_model:
+        ap.error(f"{', '.join(suite_as_model)}: that is a SUITE, not a model id — "
+                 f"suites go after -s: quality -s {suite_as_model[0]} MODEL")
+
+    wanted = list(args.models) + ([args.judge] if args.judge and
+                                  any(d in JUDGED_DATASETS for d in datasets) else [])
+    if not args.dry_run and not args.skip_model_check:
+        served = served_models(base, key)
+        if served:
+            missing = [m for m in wanted if m not in served]
+            if missing:
+                lines = []
+                for m in missing:
+                    near = difflib.get_close_matches(m, served, 3)
+                    lines.append(f"  {m}" + (f" — did you mean {', '.join(near)}?" if near else ""))
+                ap.error("model id not served by " + base + ":\n" + "\n".join(lines) +
+                         f"\n  the server lists {len(served)} models; "
+                         f"--skip-model-check bypasses this")
+
     limit = args.limit
     if limit is None:
         limit = SMOKE_LIMIT if args.suite == "smoke" else int(env("QUALITY_LIMIT", "250"))
-    batch = args.batch_size or int(env("QUALITY_BATCH", "2"))
+    try:
+        default_batch, per_model_batch = parse_batch(args.batch_size,
+                                                     int(env("QUALITY_BATCH", "2")))
+    except ValueError as exc:
+        ap.error(f"--batch-size: {exc}")
 
     rc = 0
+    results = collections.OrderedDict()
+    run_dirs = []
+    taken = set()   # dirs this run has claimed but not created yet (--dry-run)
     for entry in args.models:
         model_id = f"{entry}{args.tag}"
+        batch = per_model_batch.get(entry, default_batch)
+        # The work-dir is timestamped HERE, with --no-timestamp, instead of
+        # letting evalscope append its own: the reports can then be read back
+        # from a known path rather than scraped out of the log.
+        stamp = os.path.join(out_root, label, time.strftime("%Y%m%d_%H%M%S"))
+        run_dir, suffix = stamp, 2
+        while run_dir in taken or os.path.exists(run_dir):
+            # Two models can start within the same second (a fast failure);
+            # sharing a work-dir would have the second one overwrite the first.
+            run_dir = f"{stamp}-{suffix}"
+            suffix += 1
+        taken.add(run_dir)
         cmd = [
             "evalscope", "eval",
             "--model", entry,
@@ -299,10 +716,11 @@ def main():
             "--limit", str(limit),
             "--eval-batch-size", str(batch),
             "--generation-config", json.dumps(
-                {"temperature": 0, "top_p": 1, "seed": 42, "max_tokens": args.max_tokens}),
+                {"temperature": 0, "top_p": 1, "seed": 42,
+                 "max_tokens": args.max_tokens, "timeout": REQUEST_TIMEOUT}),
             "--seed", "42",
-            "--timeout", "1800",
-            "--work-dir", f"{out_root}/{label}",
+            "--work-dir", run_dir,
+            "--no-timestamp",
         ]
         if args.dataset_args:
             cmd += ["--dataset-args", args.dataset_args]
@@ -324,12 +742,45 @@ def main():
                            for i, c in enumerate(cmd)))
             continue
 
-        print(f"\n=== {model_id}: {','.join(datasets)} (limit {limit}) ===", flush=True)
+        print(f"\n=== {model_id}: {', '.join(datasets)} "
+              f"(limit {limit}, batch {batch}) ===", flush=True)
         t0 = time.time()
-        r = subprocess.run(cmd)
-        print(f"=== {model_id} finished in {time.time() - t0:.0f}s (rc={r.returncode}) ===",
-              flush=True)
-        rc = rc or r.returncode
+        try:
+            r, filt = run_eval(cmd, args.verbose)
+        except KeyboardInterrupt:
+            print(f"\n--- {model_id} interrupted after {hms(time.time() - t0)} "
+                  f"({run_dir}) ---", flush=True)
+            return 130
+        elapsed = time.time() - t0
+        rows = read_reports(run_dir, model_id)
+        results[model_id] = rows
+        run_dirs.append(run_dir)
+
+        if r != 0 or not rows:
+            # A failure is the one case where the filtered stream is not
+            # enough: show what evalscope said just before it stopped, and
+            # where the full log is.
+            partial = " — partial results below" if rows else ""
+            print(f"--- {model_id} FAILED (rc={r}) after {hms(elapsed)}{partial} ---")
+            if filt is not None and filt.tail:
+                for line in list(filt.tail)[-15:]:
+                    print(f"  | {line}")
+            print(f"  full log: {os.path.join(run_dir, 'logs', 'eval_log.log')}")
+            rc = rc or r or 1
+            continue
+
+        # A run that scored every sample but logged errors along the way is the
+        # failure mode this tool exists to catch (a broken grader, a flaky
+        # endpoint), so the count goes on the line that says it finished.
+        noted = f", {filt.problems} error(s) logged" if filt and filt.problems else ""
+        print(f"--- {model_id} done in {hms(elapsed)}{noted} ---", flush=True)
+
+    if args.dry_run:
+        return 0
+
+    print_results(results)
+    if run_dirs:
+        print(f"\nreports: {', '.join(run_dirs)}")
     return rc
 
 

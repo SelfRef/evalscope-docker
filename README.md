@@ -36,6 +36,7 @@ A run is *just a model id*.
 ```
 quality my-model                     # default suite, default limit
 quality model-a model-b              # A/B — evaluated one at a time, never concurrently
+quality -s fast a b c                # ONE benchmark — quickest way to rank a few models
 quality -s tools model-a             # tool calling (BFCL v3)
 quality -s pl my-model --limit 100   # local judged set from the suites dir
 quality -s smoke my-model            # ~1 min wiring check
@@ -44,7 +45,20 @@ quality -s ifeval,gsm8k my-model     # an ad-hoc combination
 quality --list                       # suites + resolved configuration
 quality --list-datasets              # every benchmark id evalscope has registered
 quality --dry-run -s tools my-model  # print the evalscope command, run nothing
+quality -v my-model                  # stream evalscope's raw output instead of scores
 ```
+
+Output is a **result, not a log**. evalscope's INFO stream, its config dump, the nested tqdm
+bars and its perf tables are filtered out; what is left is a progress line, anything that
+went wrong, and a score table read back from the report JSON — pivoted model-per-column when
+more than one model was named, which is the table an A/B is actually run for. A failure prints
+the tail of what evalscope said plus the path to the full log. `-v` turns the filter off.
+
+Model ids are checked against the server's `/v1/models` **before** anything is loaded. Without
+that check a typo costs five retries and a full `openai.NotFoundError` traceback *per sample*,
+which is a page of Python for what is really a one-line mistake; a suite name typed where a
+model belongs (`quality quality my-model`) is called out by name. `--skip-model-check` is there
+for a server whose served ids differ from its routes.
 
 `-s` takes either a suite name or benchmark ids, comma-separated: the suites below are
 shorthands for combinations worth re-running, not the set of things that can be run. Any of
@@ -56,10 +70,19 @@ against the registry *before* a model is loaded.
 | suite | datasets | notes |
 |---|---|---|
 | `quality` (default) | ifeval, gsm8k, humaneval | objectively graded, no judge |
+| `fast` | humaneval | quick ranking: fixed n=164, no judge, code only |
 | `tools` | bfcl_v3 | 9 curated subsets incl. both irrelevance sets |
 | `pl` | general_qa | local `suites/pl_starter.jsonl`, LLM-judged |
 | `reasoning` | gsm8k | quick, no code |
 | `smoke` | gsm8k (limit 5) | wiring check |
+
+**Why `fast` is humaneval and not one of the other two.** It is the one that *moves*: gsm8k is
+saturated for any competent mid-size model (96-98 %, no headroom to rank with) and ifeval has
+come back statistically identical between builds that differ measurably elsewhere. humaneval
+also has a **fixed n of 164**, so there is no `--limit` to choose, defend, or forget to keep
+equal across arms, and it is graded by running the tests rather than by a judge model. The
+trade is that it measures Python generation in English and nothing else — `tools` is the one
+for the agent role, and a result worth publishing still comes from the full `quality` suite.
 
 ### Configuration
 
@@ -70,7 +93,7 @@ against the registry *before* a model is loaded.
 | `EVALSCOPE_API_PATH` | `/upstream/{model}/v1/chat/completions` | request path; `{model}` is substituted |
 | `QUALITY_SUITE` | `quality` | default suite |
 | `QUALITY_LIMIT` | `250` | default `--limit` (**per subset**) |
-| `QUALITY_BATCH` | `2` | concurrent requests |
+| `QUALITY_BATCH` | `2` | concurrent requests (fallback for models not named in a `--batch-size` map) |
 | `QUALITY_JUDGE` | *(unset)* | model id used as judge by judged suites |
 | `QUALITY_OUTPUT` | `/data/outputs` | run output root |
 | `QUALITY_SUITES_DIR` | `/work/suites` | custom dataset dir |
