@@ -49,21 +49,40 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 # through /v1/embeddings and /v1/rerank — evalscope's RAGEval backend ships an
 # APIEncoder, so the SERVED endpoint is evaluated rather than a separate local
 # copy of the weights.
+# needle-haystack: matplotlib + seaborn. They are used only to render the
+# heatmap, but NeedleHaystackAdapter.__init__ calls check_import on them, so
+# without the extra the benchmark cannot be constructed at all and
+# `-s needle_haystack` dies with "The following modules are not found:
+# matplotlib, seaborn" before a single sample runs. That is the only
+# long-context retrieval benchmark here, so the 60 MB is worth it.
 #
-# The last two lines are BUILD CANARIES. Both graders are only imported at
-# SCORING time, so without them a broken dependency chain ships as an image
-# that runs happily and scores every sample zero.
+# The last three lines are BUILD CANARIES. Those graders are only imported at
+# SCORING time (or, for needle_haystack, at adapter construction), so without
+# them a broken dependency chain ships as an image that runs happily and
+# scores every sample zero.
 RUN pip install --no-cache-dir \
-      "evalscope[ifeval,bfcl,multi-if,rag]==${EVALSCOPE_VERSION}" \
+      "evalscope[ifeval,bfcl,multi-if,rag,needle-haystack]==${EVALSCOPE_VERSION}" \
       soundfile \
     && python -c "import evalscope, langdetect; print(evalscope.__version__)" \
     && python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__; print(torch.__version__)" \
-    && python -c "from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker; print('bfcl ast_checker OK')"
+    && python -c "from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker; print('bfcl ast_checker OK')" \
+    && python -c "from evalscope.utils.import_utils import check_import; \
+check_import(['matplotlib', 'seaborn'], 'needle_haystack', raise_error=True); \
+print('needle_haystack extra OK')"
 
 # NLTK data, baked in. IFEval's sentence-level instruction checkers tokenise
 # with punkt; without the resource those samples score 0 and the run reports a
 # depressed accuracy with a single ERROR line as the only clue. Downloading at
 # run time would also mean a network call per container.
+# matplotlib builds a font cache on first import and writes it under $HOME.
+# Doing it here bakes the cache into the image and pins it somewhere writable,
+# so a run neither pays the cost nor warns about a non-writable config dir.
+ENV MPLBACKEND=Agg \
+    MPLCONFIGDIR=/usr/local/share/matplotlib
+RUN mkdir -p /usr/local/share/matplotlib \
+    && python -c "import matplotlib.pyplot" \
+    && chmod -R a+rX /usr/local/share/matplotlib
+
 ENV NLTK_DATA=/usr/local/nltk_data
 RUN python -m nltk.downloader -d /usr/local/nltk_data punkt punkt_tab \
     && python -c "import nltk; nltk.data.find('tokenizers/punkt_tab/english/'); print('nltk punkt_tab OK')"

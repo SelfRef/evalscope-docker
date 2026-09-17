@@ -18,10 +18,9 @@ Configuration comes from the environment:
 
     EVALSCOPE_API_BASE   base URL of the server under test (required)
     EVALSCOPE_API_KEY    bearer token                      (default EMPTY)
-    EVALSCOPE_API_PATH   request path template, "{model}" is substituted
-                         (default /upstream/{model}/v1/chat/completions, the
-                         llama-swap per-model path; use /v1/chat/completions
-                         for a plain single-model OpenAI-compatible server)
+    EVALSCOPE_API_PATH   request path template, "{model}" is substituted.
+                         Overrides --route; for servers that are not llama-swap
+    QUALITY_ROUTE        default for --route: upstream (default) | proxy
     QUALITY_SUITE        default suite                     (default quality)
     QUALITY_LIMIT        default --limit, PER SUBSET       (default 250)
     QUALITY_BATCH        default concurrent requests       (default 2)
@@ -31,10 +30,13 @@ Configuration comes from the environment:
 
 Why the defaults are what they are:
 
-  * EVALSCOPE_API_PATH defaults to llama-swap's `/upstream/<model>/` route
-    because that route bypasses any server-side request rewriting, so the eval
-    controls the sampling. Pointing at a path where the server can override
-    sampling parameters makes scores irreproducible between runs.
+  * --route defaults to llama-swap's `/upstream/<model>/` route because it
+    bypasses server-side request rewriting, so the eval controls the sampling.
+    A path where the server can override sampling makes scores irreproducible
+    between runs. `--route proxy` deliberately gives that up to measure the
+    model AS SERVED: it is the only way to evaluate a `setParamsByID` tier
+    (a tier IS a filter, so it does not exist on the upstream route), and the
+    only way to see what a production entry's filters actually do.
   * temperature 0 and a fixed seed: a quant or build A/B must not be read
     through sampling noise.
   * models are evaluated ONE AT A TIME. Where a server swaps models in and out
@@ -108,8 +110,53 @@ SUITES = {
 
 SMOKE_LIMIT = 5
 
-# Datasets that need an LLM judge rather than an objective grader.
+# Datasets THIS WRAPPER chooses to judge even though evalscope would score them
+# by rule (general_qa is ScoringPolicy.RULE_DEFAULT; the `pl` suite judges it on
+# purpose, because Rouge-L against one reference answer is not a useful grade for
+# open-ended prose).
 JUDGED_DATASETS = {"general_qa"}
+
+
+def judge_required(datasets):
+    """Of `datasets`, those evalscope itself REFUSES to score without a judge.
+
+    Some benchmarks declare ScoringPolicy.JUDGE_ONLY (no usable rule path) or
+    JUDGE_DEFAULT (a rule path exists but `auto` judges because it is more
+    faithful). For those, evalscope raises "judge.models must be provided" —
+    but only inside evaluate_model, i.e. after the datasets have been pulled.
+    Asking the registry up front turns that into the same early, actionable
+    error every other mistake here gets.
+
+    Worth knowing WHY the rule path is not an escape hatch: on needle_haystack
+    (JUDGE_DEFAULT) `--judge-strategy rule` is accepted and then scores by
+    exact_match against the whole needle sentence, so a model that answered
+    "Eat a sandwich and sit in Dolores Park on a sunny day." was scored 0
+    against a reference of "The best thing to do in San Francisco is eat a
+    sandwich and sit in Dolores Park on a sunny day." — a perfect retrieval
+    reported as 0 %. This wrapper never passes --judge-strategy, so `auto`
+    stands and that trap is unreachable through it; the check below is what
+    keeps it that way.
+
+    Returns an empty set if the registry cannot be read — a missing judge then
+    surfaces as evalscope's own (later) error rather than as a failure here.
+    """
+    try:
+        from evalscope.api.registry import BENCHMARK_REGISTRY
+        from evalscope.constants import ScoringPolicy
+    except Exception:
+        return set()
+    out = set()
+    for d in datasets:
+        meta = BENCHMARK_REGISTRY.get(d)
+        policy = getattr(getattr(meta, "data_adapter", None), "scoring_policy", None)
+        if policy in (ScoringPolicy.JUDGE_ONLY, ScoringPolicy.JUDGE_DEFAULT):
+            out.add(d)
+    return out
+
+
+def needs_judge(datasets):
+    """Datasets in this run that require a judge model, for either reason."""
+    return (set(datasets) & JUDGED_DATASETS) | judge_required(datasets)
 
 # Per-sample request timeout, seconds. Goes inside --generation-config: the
 # top-level --timeout flag is deprecated in evalscope 1.11 and warns on every
@@ -138,6 +185,21 @@ def dataset_args_for(dataset, suites_dir):
             "multi_turn_base"]}
     if dataset == "general_qa":
         return {"local_path": suites_dir, "subset_list": ["pl_starter"]}
+    if dataset == "needle_haystack":
+        # English only. The benchmark ships `english` and `chinese` corpora and
+        # runs the FULL context x depth grid for each, so keeping both doubles
+        # a run that is already the most expensive one here — every sample is a
+        # long prompt, and cost scales with context length, not sample count.
+        # Add "chinese" back explicitly if that is what is being measured.
+        #
+        # The grid itself is left at evalscope's default (1k-32k in 10 steps x
+        # 0-100 % depth in 10 steps = 100 samples) because narrowing it changes
+        # what the benchmark MEASURES rather than just what it costs. Override
+        # via extra_params when a different regime is wanted, e.g. deeper
+        # contexts: {"context_lengths_max": 128000,
+        #            "context_lengths_num_intervals": 5,
+        #            "document_depth_percent_intervals": 5}.
+        return {"subset_list": ["english"]}
     return None
 
 
@@ -190,6 +252,25 @@ def env(name, default=""):
     return os.environ.get(name, "").strip() or default
 
 
+# The two ways to reach a model behind llama-swap. They measure DIFFERENT THINGS,
+# which is why this is a flag and not a detail.
+ROUTES = {
+    # Per-model route: bypasses llama-swap's request rewriting, so the eval's
+    # sampling is what the model sees. Reproducible, and the right default for
+    # comparing builds/quants/engines.
+    "upstream": "/upstream/{model}/v1/chat/completions",
+    # Ordinary OpenAI route: llama-swap picks the model from the request body and
+    # APPLIES the entry's filters. That measures the model AS SERVED — which is
+    # the only way to evaluate a `setParamsByID` tier, because a tier is nothing
+    # but a filter. Measured on a llama-swap with thinking tiers:
+    #   proxy    qwen38-flash    -> 0 reasoning tokens  (filters force thinking off)
+    #   proxy    qwen38-flash:x  -> 38 reasoning tokens (the tier applies)
+    #   upstream qwen38-flash:x  -> 27 reasoning tokens (the SERVER default, not
+    #                               the tier — bare and :x are indistinguishable)
+    "proxy": "/v1/chat/completions",
+}
+
+
 def api_url(base, path_tmpl, model):
     return base + path_tmpl.replace("{model}", model)
 
@@ -198,16 +279,25 @@ def build_extra_args(datasets, args, base, path_tmpl, key, suites_dir):
     """Dataset-specific evalscope arguments for this run.
 
     evalscope takes a SINGLE --dataset-args object, so the per-dataset entries
-    are merged into one.
+    are merged into one. A raw `--dataset-args` from the caller REPLACES that
+    object — but only that object. It used to replace this function's whole
+    return value, which silently dropped `--judge` too, so a judged benchmark
+    plus a hand-written --dataset-args failed deep inside evalscope with
+    "judge.models must be provided" even though a judge had been named on the
+    command line. That is also why the pre-flight judge check used to exempt
+    --dataset-args runs; it no longer has to.
     """
     extra = []
 
-    ds_args = {d: a for d in datasets
-               for a in [dataset_args_for(d, suites_dir)] if a}
-    if ds_args:
-        extra += ["--dataset-args", json.dumps(ds_args)]
+    if args.dataset_args:
+        extra += ["--dataset-args", args.dataset_args]
+    else:
+        ds_args = {d: a for d in datasets
+                   for a in [dataset_args_for(d, suites_dir)] if a}
+        if ds_args:
+            extra += ["--dataset-args", json.dumps(ds_args)]
 
-    if any(d in JUDGED_DATASETS for d in datasets):
+    if needs_judge(datasets):
         # Judge with a DIFFERENT model than the one under test — judging with
         # the model under test is self-preference bias. If the server swaps
         # models within one GPU, prefer a judge that is not in the same
@@ -455,6 +545,44 @@ def read_reports(run_dir, model_id):
     return rows
 
 
+def judge_health(run_dir, model_id):
+    """(scored, total, reasons) for the LLM-judge verdicts in a finished run.
+
+    A judged benchmark whose JUDGE failed still produces a complete-looking
+    report full of zeros: evalscope records the failure per sample as
+    `score.status == "degraded"` with a `judge_summary`, but the aggregate is
+    just 0.0 and nothing in the score table says why. That is the same failure
+    mode `--ignore-errors` is off by default to avoid — a broken grader reading
+    as a bad model — so it gets the same treatment: reported, not swallowed.
+
+    Seen for real with a 0.8B model as judge: every verdict came back
+    `parse_error`, coverage 0.0, and the table said 0.0000 for answers that
+    were in fact correct.
+    """
+    scored = total = 0
+    reasons = collections.Counter()
+    for path in glob.glob(os.path.join(run_dir, "reviews", model_id, "*.jsonl")):
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    try:
+                        summary = json.loads(line)["sample_score"]["score"]["judge_summary"]
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    # Rule-graded samples carry the key with a null value, so a
+                    # missing key is not the only "no judge here" shape.
+                    if not isinstance(summary, dict):
+                        continue
+                    total += 1
+                    if summary.get("status") != "degraded":
+                        scored += 1
+                    for reason, n in (summary.get("failures") or {}).items():
+                        reasons[reason] += n
+        except OSError:
+            continue
+    return scored, total, reasons
+
+
 def print_table(headers, rows, aligns, out=sys.stdout):
     if not rows:
         return
@@ -563,6 +691,14 @@ def main():
                          "Accepts per-model pairs (`a=4,b=2`) so models with different "
                          "slot counts can still be evaluated in ONE run, which is what "
                          "produces the cross-model table.")
+    ap.add_argument("--route", choices=sorted(ROUTES), default=env("QUALITY_ROUTE", "upstream"),
+                    help="how to reach the model on a llama-swap server. "
+                         "'upstream' (default) bypasses its filters so the eval controls "
+                         "sampling — reproducible, for comparing builds. 'proxy' goes "
+                         "through the normal route so the entry's filters APPLY — measures "
+                         "the model as served, and is the only way to evaluate a "
+                         "setParamsByID tier such as mymodel:x. "
+                         "(default: $QUALITY_ROUTE, else upstream)")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--judge", default=env("QUALITY_JUDGE"),
                     help="model id used as LLM judge for judged suites "
@@ -591,14 +727,22 @@ def main():
     args = ap.parse_args()
 
     base = env("EVALSCOPE_API_BASE").rstrip("/")
-    path_tmpl = env("EVALSCOPE_API_PATH", "/upstream/{model}/v1/chat/completions")
+    # An explicit EVALSCOPE_API_PATH is for servers that are not llama-swap at
+    # all, so it wins outright; --route only chooses between the two llama-swap
+    # shapes. Saying both is a contradiction, not a preference.
+    explicit_path = env("EVALSCOPE_API_PATH")
+    if explicit_path and args.route != env("QUALITY_ROUTE", "upstream"):
+        ap.error("--route and EVALSCOPE_API_PATH set the same thing: "
+                 f"unset EVALSCOPE_API_PATH (={explicit_path}) or drop --route")
+    path_tmpl = explicit_path or ROUTES[args.route]
     key = env("EVALSCOPE_API_KEY", "EMPTY")
     out_root = env("QUALITY_OUTPUT", "/data/outputs")
     suites_dir = env("QUALITY_SUITES_DIR", "/work/suites")
 
     if args.list:
         print(f"api base   : {base or 'NOT SET (set EVALSCOPE_API_BASE)'}")
-        print(f"api path   : {path_tmpl}")
+        print(f"api path   : {path_tmpl}"
+              + (f"  [--route {args.route}]" if not explicit_path else "  [EVALSCOPE_API_PATH]"))
         print(f"api key    : {'set' if key != 'EMPTY' else 'not set'}")
         print(f"output     : {out_root}")
         print(f"suites dir : {suites_dir}")
@@ -646,12 +790,25 @@ def main():
                          f"  suites: {', '.join(sorted(SUITES))}\n"
                          f"  --list-datasets shows every benchmark id")
 
+    # The proxy route hands sampling back to the server, which is the whole point
+    # of choosing it — but it retires this tool's central reproducibility promise,
+    # so it is stated every run rather than buried in --list.
+    proxy_route = "{model}" not in path_tmpl
+    if proxy_route and not (args.list or args.list_datasets or args.dry_run):
+        print("  ! route=proxy: the server's filters APPLY, so sampling is NOT pinned by "
+              "this tool. Scores measure the model AS SERVED (tiers included) and are "
+              "only comparable against other route=proxy runs of the same config.")
+
     if not args.models:
         ap.error("give at least one model id (or --list)")
     if not base:
         ap.error("EVALSCOPE_API_BASE is not set — point it at the server under test")
-    if any(d in JUDGED_DATASETS for d in datasets) and not args.judge and not args.dataset_args:
-        ap.error(f"{', '.join(sorted(JUDGED_DATASETS & set(datasets)))} is LLM-judged: "
+    judged = needs_judge(datasets)
+    if judged and not args.judge:
+        forced = judge_required(datasets)
+        why = ("scores ONLY with an LLM judge (evalscope refuses to run it otherwise)"
+               if forced & judged else "is LLM-judged")
+        ap.error(f"{', '.join(sorted(judged))} {why}: "
                  f"set QUALITY_JUDGE (or --judge) to a model OTHER than the one under test")
 
     # A suite name where a model id belongs (`quality my-model` read as two
@@ -664,7 +821,7 @@ def main():
                  f"suites go after -s: quality -s {suite_as_model[0]} MODEL")
 
     wanted = list(args.models) + ([args.judge] if args.judge and
-                                  any(d in JUDGED_DATASETS for d in datasets) else [])
+                                  needs_judge(datasets) else [])
     if not args.dry_run and not args.skip_model_check:
         served = served_models(base, key)
         if served:
@@ -722,10 +879,7 @@ def main():
             "--work-dir", run_dir,
             "--no-timestamp",
         ]
-        if args.dataset_args:
-            cmd += ["--dataset-args", args.dataset_args]
-        else:
-            cmd += build_extra_args(datasets, args, base, path_tmpl, key, suites_dir)
+        cmd += build_extra_args(datasets, args, base, path_tmpl, key, suites_dir)
         if args.ignore_errors:
             cmd.append("--ignore-errors")
         if args.use_cache:
@@ -755,6 +909,15 @@ def main():
         rows = read_reports(run_dir, model_id)
         results[model_id] = rows
         run_dirs.append(run_dir)
+
+        # A judge that could not produce a verdict makes the scores below
+        # meaningless rather than bad. Say so before they are printed.
+        j_ok, j_total, j_why = judge_health(run_dir, model_id)
+        if j_total and j_ok < j_total:
+            why = ", ".join(f"{n}x {r}" for r, n in j_why.most_common()) or "no usable verdict"
+            print(f"  ! JUDGE DEGRADED: only {j_ok}/{j_total} samples got a usable verdict "
+                  f"({why}). The scores below are NOT a measurement of the model — "
+                  f"use a stronger judge model (--judge / QUALITY_JUDGE).")
 
         if r != 0 or not rows:
             # A failure is the one case where the filtered stream is not
