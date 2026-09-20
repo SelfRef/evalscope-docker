@@ -32,7 +32,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pulled by the cloud stack's compose as ghcr.io/selfref/evalscope-docker.
+  # Single-platform: the image is only ever run on x86-64 hosts.
   PLATFORMS: linux/amd64
 
 jobs:
