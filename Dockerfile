@@ -56,12 +56,17 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 # matplotlib, seaborn" before a single sample runs. That is the only
 # long-context retrieval benchmark here, so the 60 MB is worth it.
 #
+# pyarrow<26: bfcl-eval pins numpy==1.26.4, and pyarrow 26 needs NumPy 2 at
+# import time without declaring it, so pip resolves the pair and `import
+# datasets` then fails. Drop the cap once bfcl-eval allows NumPy 2.
+#
 # The last three lines are BUILD CANARIES. Those graders are only imported at
 # SCORING time (or, for needle_haystack, at adapter construction), so without
 # them a broken dependency chain ships as an image that runs happily and
 # scores every sample zero.
 RUN pip install --no-cache-dir \
       "evalscope[ifeval,bfcl,multi-if,rag,needle-haystack]==${EVALSCOPE_VERSION}" \
+      "pyarrow<26" \
       soundfile \
     && python -c "import evalscope, langdetect; print(evalscope.__version__)" \
     && python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__; print(torch.__version__)" \
