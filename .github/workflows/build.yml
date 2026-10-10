@@ -4,11 +4,6 @@ on:
   push:
     branches: [master]
     tags: ["v*"]
-    paths:
-      - Dockerfile
-      - scripts/**
-      - suites/**
-      - .github/workflows/build.yml
   pull_request:
     paths:
       - Dockerfile
